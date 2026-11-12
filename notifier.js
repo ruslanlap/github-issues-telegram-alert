@@ -52,19 +52,17 @@ function createNotifier(config, io) {
       const topicFor = x => config.topics?.[x.payload.repository?.full_name] || config.topics?.[x.event];
       const topic = topicFor(entry);
       const batch = [entry];
-      const formatted = format(entry.event, entry.payload);
-      let text = formatted?.text;
-      const buttons = formatted?.button ? [formatted.button] : [];
+      let text = format(entry.event, entry.payload);
       if (!text) { const next = copy(); next.queue = next.queue.filter(x => x.id !== entry.id); save(next); return; }
       if (config.digestMs) {
         for (const candidate of state.queue) {
           if (candidate.id === entry.id || candidate.next > Date.now() || topicFor(candidate) !== topic) continue;
           const part = format(candidate.event, candidate.payload);
-          if (part && text.length + part.text.length + 2 <= 4000 && buttons.length + (part.button ? 1 : 0) <= 100) { text += '\n\n' + part.text; if (part.button) buttons.push(part.button); batch.push(candidate); }
+          if (part && text.length + part.length + 2 <= 4000) { text += '\n\n' + part; batch.push(candidate); }
         }
       }
       try {
-        const result = await io.send({ chat_id: config.chatId, text, parse_mode:'HTML', link_preview_options:{is_disabled:true}, ...(buttons.length ? {reply_markup:{inline_keyboard:buttons.map(button=>[button])}} : {}), ...(topic ? {message_thread_id: topic} : {}) });
+        const result = await io.send({ chat_id: config.chatId, text, ...(topic ? {message_thread_id: topic} : {}) });
         if (!result || !Number.isSafeInteger(result.message_id)) throw Error('Telegram returned no message_id');
         const next = copy();
         const item = entry.payload.issue || entry.payload.pull_request;

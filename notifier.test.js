@@ -34,7 +34,7 @@ test('digest combines queued events into a single message', async () => {
   await new Promise(r => setTimeout(r,5));
   await n.process();
   assert.equal(sent.length,1);
-  assert.equal((sent[0].text.match(/новий issue/g) || []).length,2);
+  assert.equal((sent[0].text.match(/a\/b/g) || []).length,2);
   fs.rmSync(dir,{recursive:true,force:true});
 });
 
@@ -90,8 +90,7 @@ test('long issue text preserves link and author, retries survive restart, and Te
   const state=JSON.parse(fs.readFileSync(config.dataFile)); state.queue[0].next=0; fs.writeFileSync(config.dataFile,JSON.stringify(state));
   n=createNotifier(config,{send:async x=>(sent.push(x),{message_id:7}),comment:async x=>comments.push(x)});
   await n.process();
-  assert.equal(sent[0].reply_markup.inline_keyboard[0][0].url,'https://github.com/a/b/issues/1');
-  assert.equal(sent[0].parse_mode,'HTML'); assert.equal(sent[0].link_preview_options.is_disabled,true);
+  assert.match(sent[0].text,/https:\/\/github.com\/a\/b\/issues\/1/);
   assert.match(sent[0].text,/alice/); assert.match(sent[0].text,/description/); assert.ok(sent[0].text.length<=4000);
   const update={update_id:10,message:{chat:{id:1},from:{id:2},text:'hello',reply_to_message:{message_id:7}}};
   assert.equal(await n.receiveTelegram(update,'t'),200);
@@ -110,7 +109,7 @@ test('authorization, event rendering, filters and topic routing', async () => {
   const cases=[['issues',{action:'opened',issue:{number:1,title:'issue',body:'body',html_url:'https://example.com/i'}}],['issue_comment',{action:'created',issue:{number:1},comment:{body:'comment',html_url:'https://example.com/c'}}],['pull_request',{action:'opened',pull_request:{number:2,title:'pr'}}],['pull_request_review',{action:'submitted',pull_request:{number:2},review:{state:'approved'}}],['star',{action:'created'}],['push',{ref:'refs/heads/main',commits:[{id:'abcdef123',message:'commit message'}],compare:'https://example.com/diff'}],['check_run',{action:'completed',check_run:{conclusion:'failure',name:'build'}}],['workflow_run',{action:'completed',workflow_run:{conclusion:'failure',name:'ci'}}]];
   for (const [i,[event,payload]] of cases.entries()) { assert.equal(post(event,{...base,...payload},String(i)),200); await n.process(); }
   assert.equal(sent.length,cases.length); assert.ok(sent.every(x=>x.message_thread_id===123));
-  assert.match(sent[5].text,/abcdef1.*commit message/); assert.equal(sent[1].reply_markup,undefined);
+  assert.match(sent[5].text,/abcdef1.*commit message/); assert.match(sent[1].text,/https:\/\/example.com\/c/);
   post('issues',{...base,sender:{login:'other'},action:'opened',issue:{number:4}},'filtered'); await n.process(); assert.equal(sent.length,cases.length);
   assert.equal(await n.receiveTelegram({message:{chat:{id:1},from:{id:3},text:'x',reply_to_message:{message_id:1}}},'t'),403);
   assert.equal(await n.receiveTelegram({message:{chat:{id:9},from:{id:2},text:'x',reply_to_message:{message_id:1}}},'t'),403);
