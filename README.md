@@ -1,427 +1,46 @@
-# 📬 GitHub → Telegram Notifier
+# GitHub → Telegram notifier
 
-Real-time GitHub webhook notifications sent directly to your Telegram chat. Stay updated on issues, pull requests, comments, pushes, and stars without constantly checking GitHub.
+Receives signed GitHub events and queues Telegram notifications. Authorized users can reply to individual issue/PR notifications. Supports issues, issue comments, pull requests including review requests, submitted PR reviews, pushes, stars, failed check runs and failed workflow runs.
 
-![Node.js](https://img.shields.io/badge/Node.js-18+-339933?style=flat&logo=node.js&logoColor=white)
-![Express](https://img.shields.io/badge/Express-5.x-000000?style=flat&logo=express&logoColor=white)
-![License](https://img.shields.io/badge/License-ISC-blue?style=flat)
+## Setup
 
----
+Node 22.5+ required for the test suite (`node:sqlite`); Node 20+ can run the server. Run `npm ci`, then configure these environment variables (for local use put them in an untracked `.env`):
 
-## 🎯 Проблема
+| Variable | Purpose |
+|---|---|
+| `WEBHOOK_SECRET` | Random GitHub webhook secret; use the identical value on GitHub |
+| `TELEGRAM_BOT_TOKEN` | BotFather token |
+| `TELEGRAM_CHAT_ID` | Destination chat ID |
+| `TELEGRAM_WEBHOOK_SECRET` | Independent random secret, 1–256 letters, digits, `_` or `-` |
+| `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated numeric Telegram user IDs permitted to reply |
+| `STATE_FILE` | Absolute path to a writable state file; Render Free uses `/tmp/notifier-state.json` |
+| `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY` | Both required for replies; key may contain literal `\n` line breaks |
+| `PORT` | HTTP port, default 3000 |
 
-Розробники часто пропускають важливі події у своїх GitHub репозиторіях:
-- Нові issues, які потребують уваги
-- Pull requests, що чекають на review
-- Коментарі від колег
-- Зміни в коді (push)
+Create a GitHub App webhook at `https://your-host/webhook` with content type JSON and the configured secret. Subscribe to the event types you need, including Pull request review, Check run and Workflow run for review and CI notifications. Install the App on the relevant repositories. For replies grant Issues write permission (and Pull requests permission for PRs). Repository webhooks without App installation IDs can notify but cannot map replies.
 
-**Постійно перевіряти GitHub — втомлює та відволікає від роботи.**
+Set `TELEGRAM_WEBHOOK_URL=https://your-host/telegram-webhook` and run `node setup-telegram-webhook.js`. This sends the secret to Telegram as `secret_token`; use HTTPS. Telegram sends it in `X-Telegram-Bot-Api-Secret-Token`. Add the bot to the destination chat and allow the specified user IDs. Start with `npm start`.
 
----
+Optional comma-separated allowlists `FILTER_REPOS` (e.g. `owner/repo`), `FILTER_EVENTS` (GitHub webhook names), `FILTER_ACTORS` (sender login) and `FILTER_LABELS` (at least one matching issue/PR label) restrict notifications; empty means unrestricted. Label filtering excludes events without matching labels. `TOPIC_ROUTES` is a JSON object mapping repository names or event names to Telegram topic IDs; repository takes precedence. `DIGEST_MS` enables delayed batching by topic; batched messages cannot be replied to as a specific issue. A batch respects Telegram's 4000-character limit.
 
-## ✅ Рішення
+## Cloudflare Workers migration (not deployed)
 
-Цей сервіс автоматично надсилає сповіщення в Telegram при:
+`worker-entry.mjs`, `worker.js`, `format.js`, `schema.sql` and `wrangler.toml` provide an alternative to Render. Create a D1 database and Queue, replace the database ID in `wrangler.toml`, apply `schema.sql` to that D1 database, and configure the same webhook, Telegram, filtering, topic, and GitHub App settings above as Worker secrets/variables. The Worker requires `WEBHOOK_SECRET`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` and `TELEGRAM_ALLOWED_USER_IDS`; GitHub App credentials are needed for replies. Do not configure `STATE_FILE`. Set webhooks only after the Worker and schema are ready; this repository does not automate migration or deploy anything.
 
-| Подія | Опис |
-|-------|------|
-| 🔵 **Issues** | Створення, закриття, повторне відкриття |
-| 💬 **Comments** | Нові коментарі до issues |
-| 🔀 **Pull Requests** | Створення, merge, закриття |
-| 📦 **Push** | Нові коміти з переліком змін |
-| ⭐ **Stars** | Коли хтось ставить зірку репозиторію |
+D1 stores each authenticated delivery before Queue publication; a one-minute cron republishes due work if publication fails or a consumer crashes. Leases prevent concurrent processing, and failed sends retry with backoff. Cron processes at most 100 due entries per invocation. D1 and external API calls are not transactional: Telegram messages or GitHub comments can be duplicated after an uncertain response/crash, and a sent Telegram message may lack a reply mapping. Monitor failures, backlog, and D1 storage. Existing file state and message mappings are **not imported**. `DIGEST_MS` batches due Worker notifications by topic, up to 4000 characters per message; a one-minute cron controls when delayed deliveries are picked up. Concurrent consumers may produce separate batches. Batched messages have no reply mapping. Worker tests use local SQLite and mocked Queue/network, not an actual Cloudflare runtime. Provisioning, deployment, and live verification remain necessary.
 
----
+## Render migration
 
-## 📸 Скріншоти
+The included blueprint uses **Render Free** and `/tmp/notifier-state.json`, without a persistent disk. Configure all required secrets and allowed user IDs, and GitHub App credentials when replies are needed. Keep exactly one instance. Review the blueprint and back up any existing state before applying it; deploying may restart the service and lose existing state. Render Free can spin down when idle, so the next request may incur a cold-start delay. Monitor GitHub deliveries and manually redeliver failures. These instructions do not deploy the blueprint automatically.
 
-<div align="center">
-  <p align="center">
-    <img src="data/issue.png" width="400" alt="GitHub Issue Notification">
-    <br>
-    <em>Приклад сповіщення про нове Issue та коментар</em>
-  </p>
-  <p align="center">
-    <img src="data/star.png" width="400" alt="GitHub Star Notification">
-    <br>
-    <em>Сповіщення про нову зірку ⭐</em>
-  </p>
-</div>
+## Reliability and operations
 
----
+**Render Free state is volatile.** A restart, redeploy, or instance replacement may erase the queue, delivery and update deduplication records, and reply mappings. Pending notifications can be lost, duplicate deliveries can be processed again, and replies to old messages may no longer work. Use one process and one instance only: the state file is not safe for multiple writers. Protect any backups: state contains delivery payloads and message mappings. Disk-full or state-write errors return 503 rather than acknowledging a new GitHub delivery. GitHub does **not** automatically redeliver failed webhook deliveries; monitor deliveries and manually redeliver failures. Successful delivery IDs are retained while state exists, so storage grows and needs monitoring.
 
-## 🚀 Швидкий старт
+Queued notifications retry with backoff after Telegram errors while state remains available. Delivery is not exactly-once: a crash or timeout after Telegram accepts a message but before state is saved can cause duplicates, and the original message may not have a reply mapping. Successful Telegram update IDs are stored and deduplicated while state remains available, but a GitHub comment may still be duplicated if the API accepts it and the response or subsequent state save fails. Update IDs grow indefinitely. GitHub signs the body, not the delivery ID or event header: someone possessing a captured signed request can replay its body under a new ID or change the event header. The Worker checks event-specific payload shapes, but overlapping shapes cannot authenticate the event header or prevent replay. Identical bodies can be legitimate distinct events, so body-based deduplication would silently discard valid notifications; this service does not claim replay protection across delivery IDs. Protect webhook traffic and logs, rotate a compromised secret, and restrict network access where feasible. Digest batches have no reply target. Telegram replies are authenticated by webhook secret, chat and user ID, and mapped by the bot's stored message ID and GitHub installation, not message text.
 
-### ⚡ Чеклист для продакшену (Render + GitHub App)
+## Tests
 
-- [ ] Створено Telegram бота через @BotFather
-- [ ] Отримано `TELEGRAM_BOT_TOKEN` та `TELEGRAM_CHAT_ID`
-- [ ] Створено GitHub App з правильним **Webhook URL** (`https://your-app.onrender.com/webhook` ⚠️ з `/webhook`!)
-- [ ] Згенеровано `WEBHOOK_SECRET` та додано в GitHub App та Render
-- [ ] Отримано `GITHUB_APP_ID` та `GITHUB_PRIVATE_KEY` з GitHub App
-- [ ] Задеплоєно на Render з усіма змінними оточення
-- [ ] Встановлено GitHub App на потрібний репозиторій
-- [ ] Налаштовано Telegram webhook через `setup-telegram-webhook.js`
-- [ ] Протестовано: створив issue → отримав повідомлення в Telegram ✅
+`npm test` runs isolated tests using local HTTP and fake external clients; it does not call Telegram or GitHub. `test-webhook.js` and `test-render.js` are manual network scripts, not part of the automated suite; do not run against a deployment unintentionally.
 
----
-
-### 1. Клонування та встановлення
-
-```bash
-git clone https://github.com/yourusername/issue-telegram-notifier.git
-cd issue-telegram-notifier
-npm install
-```
-
-### 2. Створення Telegram бота
-
-1. Напишіть [@BotFather](https://t.me/BotFather) в Telegram
-2. Надішліть `/newbot` та дотримуйтесь інструкцій
-3. Збережіть отриманий **Bot Token**
-
-### 3. Отримання Chat ID
-
-1. Додайте бота в чат/групу
-2. Напишіть боту будь-яке повідомлення
-3. Відкрийте: `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
-4. Знайдіть `"chat":{"id": XXXXXXXX}` — це ваш **Chat ID**
-
-### 4. Налаштування змінних оточення
-
-Створіть файл `.env`:
-
-```env
-# Telegram
-TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
-TELEGRAM_CHAT_ID=-1001234567890
-
-# GitHub Webhook
-WEBHOOK_SECRET=your_secure_random_string
-
-# GitHub App (опціонально, якщо використовуєш GitHub App)
-GITHUB_APP_ID=2564133
-GITHUB_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----"
-
-# Render keep-alive (для локального тестування)
-RENDER_EXTERNAL_URL=http://localhost:3000
-KEEPALIVE_ENABLED=true
-KEEPALIVE_INTERVAL_MS=300000
-
-# Server
-PORT=3000
-```
-
-**Примітки:**
-- `WEBHOOK_SECRET` — згенеруй через `openssl rand -hex 32`
-- `GITHUB_PRIVATE_KEY` — має бути в лапках, переноси рядків як `\n`
-- `RENDER_EXTERNAL_URL` — на Render встановлюється автоматично, локально вкажи `http://localhost:3000`
-
-### 5. Запуск сервера
-
-```bash
-node server.js
-```
-
-Повідомлення в консолі:
-```
-🚀 Server running on port 3000
-📡 Webhook endpoint: http://localhost:3000/webhook
-```
-
----
-
-## 🔗 Налаштування GitHub App (рекомендовано)
-
-GitHub App дозволяє боту відповідати на коментарі з Telegram та писати їх у GitHub issues.
-
-### 1. Створення GitHub App
-
-1. Перейдіть на [GitHub Settings → Developer settings → GitHub Apps](https://github.com/settings/apps)
-2. Натисніть **"New GitHub App"**
-3. Заповніть обов'язкові поля:
-
-| Поле | Значення |
-|------|----------|
-| **GitHub App name** | `issue-telegram-notifier` (або будь-яке ім'я) |
-| **Homepage URL** | `https://your-app.onrender.com/` |
-| **Webhook URL** | `https://your-app.onrender.com/webhook` ⚠️ **ВАЖЛИВО: має бути `/webhook` в кінці!** |
-| **Webhook secret** | Той самий, що в `.env` (`WEBHOOK_SECRET`) |
-
-4. **Permissions** (обов'язково налаштуйте):
-
-| Permission | Access |
-|------------|--------|
-| **Issues** | Read & write (для відповідей з Telegram) |
-| **Pull requests** | Read |
-| **Metadata** | Read-only |
-
-5. **Subscribe to events** (включити):
-   - ✅ Issues
-   - ✅ Issue comment
-   - ✅ Pull request
-   - ✅ Push
-   - ✅ Star
-
-6. Натисніть **"Create GitHub App"**
-
-### 2. Отримання App ID та Private Key
-
-1. На сторінці App знайди **App ID** (наприклад, `2564133`)
-2. Натисни **"Generate a new private key"** → завантажиться `.pem` файл
-3. Відкрий `.pem` файл та скопіюй весь вміст (включно з `-----BEGIN RSA PRIVATE KEY-----` та `-----END RSA PRIVATE KEY-----`)
-
-### 3. Додавання змінних оточення
-
-Додай до `.env`:
-
-```env
-GITHUB_APP_ID=2564133
-GITHUB_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----"
-```
-
-**Важливо:** `GITHUB_PRIVATE_KEY` має бути в лапках, а переноси рядків заміни на `\n`.
-
-### 4. Встановлення App на репозиторій
-
-1. На сторінці App натисни **"Install App"**
-2. Вибери репозиторій (або всі репозиторії)
-3. Натисни **"Install"**
-
----
-
-## 📱 Налаштування Telegram Webhook
-
-Для того, щоб бот міг отримувати відповіді з Telegram та писати їх у GitHub:
-
-```bash
-# Варіант 1: через curl (підстав свій токен)
-curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
-  -d "url=https://your-app.onrender.com/telegram-webhook"
-
-# Варіант 2: через Node.js скрипт
-node setup-telegram-webhook.js
-```
-
-Перевірка налаштування:
-
-```bash
-curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo"
-```
-
-Має повернути `"url": "https://your-app.onrender.com/telegram-webhook"`.
-
----
-
-## ⚠️ Типові проблеми та вирішення
-
-### Проблема 1: Webhook не спрацьовує
-
-**Симптоми:**
-- Події з GitHub не надходять в Telegram
-- В логах Render немає записів `📨 GitHub: issues -> opened`
-
-**Рішення:**
-
-1. **Перевір Webhook URL в GitHub App:**
-   - ❌ Неправильно: `https://your-app.onrender.com`
-   - ✅ Правильно: `https://your-app.onrender.com/webhook`
-   
-   **ВАЖЛИВО:** URL має закінчуватися на `/webhook`!
-
-2. **Перевір Webhook Secret:**
-   - `WEBHOOK_SECRET` на Render має **точно співпадати** з secret у GitHub App
-   - Якщо не співпадає → зміни в GitHub App → "Change secret" → онови на Render
-
-3. **Перевір, чи App встановлений:**
-   - GitHub → Settings → Integrations → GitHub Apps
-   - Знайди свій App → перевір, чи він встановлений на потрібний репозиторій
-
-### Проблема 2: "Invalid signature" в логах
-
-**Причина:** `WEBHOOK_SECRET` не співпадає між GitHub App та Render.
-
-**Рішення:**
-1. Згенеруй новий secret (наприклад, через `openssl rand -hex 32`)
-2. Онови в GitHub App → Webhook → "Change secret"
-3. Онови на Render → Environment → `WEBHOOK_SECRET`
-4. Перезапусти сервіс на Render
-
-### Проблема 3: Render instance "спить" (cold start)
-
-**Симптоми:** Перший запит після неактивності займає 30+ секунд.
-
-**Рішення:** Keep-alive вже налаштований в `render.yaml`:
-- `KEEPALIVE_ENABLED=true`
-- `KEEPALIVE_INTERVAL_MS=300000` (5 хвилин)
-
-Якщо хочеш частіше (наприклад, кожні 30 секунд), зміни на Render:
-- `KEEPALIVE_INTERVAL_MS=30000`
-
-### Проблема 4: Telegram webhook не працює
-
-**Симптоми:** Відповіді з Telegram не потрапляють у GitHub issues.
-
-**Рішення:**
-1. Перевір, чи налаштований webhook:
-   ```bash
-   curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"
-   ```
-2. Переконайся, що URL правильний: `https://your-app.onrender.com/telegram-webhook`
-3. Перевір логи Render на помилки типу `❌ Telegram error` або `❌ GitHub API Error`
-
-### Проблема 5: "GitHub App initialized successfully" не з'являється
-
-**Причина:** Неправильний формат `GITHUB_PRIVATE_KEY`.
-
-**Рішення:**
-- Private key має бути в лапках
-- Переноси рядків мають бути як `\n`:
-  ```env
-  GITHUB_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----"
-  ```
-
----
-
-## 🔗 Альтернатива: Звичайний GitHub Webhook (без App)
-
-Якщо не потрібна функція відповідей з Telegram:
-
-1. Перейдіть у **Settings** → **Webhooks** → **Add webhook**
-2. Заповніть поля:
-
-| Поле | Значення |
-|------|----------|
-| **Payload URL** | `https://your-domain.com/webhook` |
-| **Content type** | `application/json` |
-| **Secret** | Той самий, що в `.env` (`WEBHOOK_SECRET`) |
-| **Events** | Виберіть: `Issues`, `Issue comments`, `Pull requests`, `Pushes`, `Stars` |
-
-3. Натисніть **Add webhook**
-
----
-
-## 🌐 Деплой
-
-### Render (рекомендовано) — безкоштовно
-
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
-
-**Автоматичний деплой:**
-
-1. Перейдіть на [render.com](https://render.com)
-2. Натисніть **"New"** → **"Web Service"**
-3. Підключіть GitHub репозиторій `ruslanlap/issue-telegram-notifier`
-4. Render автоматично виявить `render.yaml` та налаштує сервіс
-5. Додайте змінні оточення в **Settings → Environment**:
-
-   **Обов'язкові:**
-   - `TELEGRAM_BOT_TOKEN` — токен від @BotFather
-   - `TELEGRAM_CHAT_ID` — ID чату/групи
-   - `WEBHOOK_SECRET` — випадковий рядок (наприклад, через `openssl rand -hex 32`)
-   
-   **Для GitHub App (якщо використовуєш App замість звичайного webhook):**
-   - `GITHUB_APP_ID` — ID з GitHub App settings
-   - `GITHUB_PRIVATE_KEY` — вміст `.pem` файлу (з переносами як `\n`)
-   
-   **Опціональні:**
-   - `KEEPALIVE_ENABLED` — `true` (за замовчуванням, для запобігання cold start)
-   - `KEEPALIVE_INTERVAL_MS` — `300000` (5 хв, за замовчуванням)
-
-6. Натисніть **"Create Web Service"**
-
-**Важливо після деплою:**
-
-1. Скопіюй URL сервісу (наприклад, `https://github-telegram-notifier.onrender.com`)
-2. Онови **Webhook URL** в GitHub App: `https://your-app.onrender.com/webhook` ⚠️ **Не забудь `/webhook` в кінці!**
-3. Налаштуй Telegram webhook (див. секцію вище)
-
-**Або вручну (якщо не використовуєш `render.yaml`):**
-
-1. **Build Command**: `npm install`
-2. **Start Command**: `npm start`
-3. **Environment**: Node
-4. Додай всі змінні оточення вручну
-
-Render надає:
-- ✅ Безкоштовний SSL сертифікат
-- ✅ Автоматичні деплої з GitHub
-- ✅ 750 годин/місяць безкоштовно
-
-### Railway
-
-⚠️ **Увага:** Railway має обмеження на безкоштовному плані.
-
-Якщо у вас є платний план:
-1. `railway init`
-2. `railway service`
-3. Встановіть змінні: `railway variables --set "KEY=value"`
-4. Підключіть GitHub репозиторій через веб-інтерфейс
-
-### Інші варіанти
-
-- **VPS/Ubuntu**: Використовуйте PM2 (`pm2 start server.js`)
-- **Docker**: Створіть Dockerfile
-- **Fly.io**, **Cyclic**, **Koyeb**
-
----
-
-## 🧪 Тестування
-
-Запустіть тестовий webhook локально:
-
-```bash
-# В першому терміналі
-node server.js
-
-# В другому терміналі
-node test-webhook.js
-```
-
-Якщо все налаштовано правильно, ви отримаєте сповіщення в Telegram.
-
----
-
-## 📁 Структура проекту
-
-```
-issue-telegram-notifier/
-├── server.js                    # Основний сервер з обробкою webhooks
-├── test-webhook.js              # Скрипт для тестування локального webhook
-├── test-render.js               # Скрипт для тестування Render instance
-├── setup-telegram-webhook.js    # Налаштування Telegram webhook
-├── render.yaml                  # Конфігурація для Render
-├── package.json                 # Залежності
-├── .env                         # Змінні оточення (не комітити!)
-├── .gitignore          
-└── README.md
-```
-
----
-
-## 🔒 Безпека
-
-- ✅ Верифікація підпису GitHub webhook (`x-hub-signature-256`)
-- ✅ Секрет зберігається в змінних оточення
-- ✅ Використовуйте HTTPS у production
-
----
-
-## 📝 Ліцензія
-
-ISC © 2024
-
----
-
-## 🤝 Contributing
-
-Pull requests вітаються! Для великих змін спершу відкрийте issue для обговорення.
-
----
-
-<div align="center">
-
-**Зроблено з ❤️ для продуктивності розробників**
-
-</div>
+ISC license.
