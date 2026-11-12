@@ -6,11 +6,25 @@ const run = (env,sql,...args) => env.DB.prepare(sql).bind(...args).run();
 const first = (env,sql,...args) => env.DB.prepare(sql).bind(...args).first();
 const all = (env,sql,...args) => env.DB.prepare(sql).bind(...args).all();
 const response = status => new Response(null,{status});
+async function readBody(request,limit) {
+  if (Number(request.headers.get('content-length')) > limit) return null;
+  if (!request.body) return Buffer.alloc(0);
+  const reader=request.body.getReader(), chunks=[]; let size=0;
+  try {
+    while (true) {
+      const {done,value}=await reader.read();
+      if (done) return Buffer.concat(chunks,size);
+      size+=value.byteLength;
+      if (size>limit) { reader.cancel().catch(()=>{}); return null; }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+}
 async function publish(env,id) { try { await env.QUEUE.send({id}); } catch (e) { console.error('Queue publish failed:',e.message); } }
 async function github(request,env) {
   if (!env.WEBHOOK_SECRET) return response(503);
-  const raw = Buffer.from(await request.arrayBuffer());
-  if (raw.length > 2*1024*1024) return response(413);
+  const raw = await readBody(request,2*1024*1024);
+  if (!raw) return response(413);
   const sig = 'sha256='+crypto.createHmac('sha256',env.WEBHOOK_SECRET).update(raw).digest('hex');
   if (!equal(request.headers.get('x-hub-signature-256'),sig)) return response(401);
   const id=request.headers.get('x-github-delivery'), event=request.headers.get('x-github-event');
@@ -92,8 +106,8 @@ async function comment(env,target,text) {
 }
 async function telegram(request,env) {
   if (!equal(request.headers.get('x-telegram-bot-api-secret-token'),env.TELEGRAM_WEBHOOK_SECRET)) return response(401);
-  const raw=await request.text(); if (Buffer.byteLength(raw)>1024*1024) return response(413);
-  let body; try { body=JSON.parse(raw); } catch { return response(400); }
+  const raw=await readBody(request,1024*1024); if (!raw) return response(413);
+  let body; try { body=JSON.parse(new TextDecoder().decode(raw)); } catch { return response(400); }
   const m=body?.message;
   if (!m || String(m.chat?.id)!==String(env.TELEGRAM_CHAT_ID) || !list(env.TELEGRAM_ALLOWED_USER_IDS).includes(String(m.from?.id))) return response(403);
   if (!m.text || !m.reply_to_message?.message_id) return response(200);

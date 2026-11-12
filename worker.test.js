@@ -12,6 +12,24 @@ function setup() {
 }
 function req(id, event, payload, secret='s') {const body=JSON.stringify(payload); return new Request('https://test/webhook',{method:'POST',headers:{'content-type':'application/json','x-github-delivery':id,'x-github-event':event,'x-hub-signature-256':'sha256='+crypto.createHmac('sha256',secret).update(body).digest('hex')},body});}
 const payload={action:'opened',repository:{full_name:'a/b'},installation:{id:3},sender:{login:'alice'},issue:{number:1,title:'issue'}};
+test('webhook body limits stop reading oversized streams, regardless of content length',async()=>{
+  const {env}=setup();
+  for (const [path,limit] of [['/webhook',2*1024*1024],['/telegram-webhook',1024*1024]]) {
+    for (const length of [undefined,'1',String(limit+1)]) {
+      let pulled=0, cancelled=false;
+      const stream=new ReadableStream({pull(controller){pulled++; if (pulled<=64) controller.enqueue(new Uint8Array(65536)); else controller.close()},cancel(){cancelled=true}},{highWaterMark:0});
+      const headers={'x-telegram-bot-api-secret-token':'t',...(length===undefined?{}:{'content-length':length})};
+      const request=new Request('https://test'+path,{method:'POST',headers,body:stream,duplex:'half'});
+      assert.equal((await worker.fetch(request,env)).status,413,`${path}: ${length}`);
+      assert.ok(pulled<=limit/65536+1,`${path}: read ${pulled} chunks`);
+      if (length!==String(limit+1)) assert.equal(cancelled,true);
+      else assert.equal(pulled,0);
+    }
+    const body=JSON.stringify({})+' '.repeat(limit-2);
+    const headers={'x-telegram-bot-api-secret-token':'t','x-hub-signature-256':'sha256='+crypto.createHmac('sha256','s').update(body).digest('hex'),'x-github-delivery':'boundary','x-github-event':'unknown'};
+    assert.equal((await worker.fetch(new Request('https://test'+path,{method:'POST',headers,body}),env)).status,path==='/webhook'?200:403);
+  }
+});
 test('authentication, deduplication and cron recover queue publish failure',async()=>{const {env,db,queued}=setup(); env.QUEUE.send=async()=>{throw Error('offline')}; assert.equal((await worker.fetch(req('bad','issues',payload,'wrong'),env)).status,401); assert.equal((await worker.fetch(req('one','issues',payload),env)).status,200); assert.equal((await worker.fetch(req('one','issues',payload),env)).status,200); assert.equal(db.prepare('select count(*) n from deliveries').get().n,1); env.QUEUE.send=async x=>queued.push(x); await worker.scheduled({},env); assert.equal(queued.length,1);});
 test('delivery retries, review and CI rendering, and reply mapping',async()=>{const {env,db,queued}=setup(); let calls=[]; const old=global.fetch; global.fetch=async(url,opts)=>{calls.push([url,JSON.parse(opts.body)]); if(calls.length===1) return new Response('{}',{status:500}); return Response.json({ok:true,result:{message_id:7}})}; try {await worker.fetch(req('one','issues',payload),env); let ack=0; const msg={body:queued[0],ack(){ack++},retry(){}}; await worker.queue({messages:[msg]},env); assert.equal(db.prepare('select attempts from deliveries').get().attempts,1); db.prepare('update deliveries set next_at=0').run(); await worker.queue({messages:[msg]},env); assert.equal(ack,2); assert.equal(db.prepare('select issue_number from messages').get().issue_number,1); assert.match(worker.format('pull_request_review',{...payload,action:'submitted',pull_request:{number:2},review:{state:'approved'}}),/approved/); assert.match(worker.format('check_run',{...payload,issue:undefined,action:'completed',check_run:{name:'build',conclusion:'failure'}}),/build/); } finally {global.fetch=old}});
 
