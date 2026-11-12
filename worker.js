@@ -51,11 +51,11 @@ async function github(request,env) {
   if (result.meta.changes && pass) await publish(env,id);
   return response(200);
 }
-async function send(env,entries,text) {
+async function send(env,entries,text,buttons) {
   const entry=entries[0], p=JSON.parse(entry.payload);
   if (!text) return null;
   const topics=JSON.parse(env.TOPIC_ROUTES || '{}'); const topic=topics[p.repository?.full_name] || topics[entry.event];
-  const res=await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:env.TELEGRAM_CHAT_ID,text,...(topic?{message_thread_id:topic}:{})}),signal:AbortSignal.timeout(10000)});
+  const res=await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:env.TELEGRAM_CHAT_ID,text,parse_mode:'HTML',link_preview_options:{is_disabled:true},...(buttons.length?{reply_markup:{inline_keyboard:buttons.map(button=>[button])}}:{}),...(topic?{message_thread_id:topic}:{})}),signal:AbortSignal.timeout(10000)});
   const body=await res.json(); if (!res.ok || !body.ok || !Number.isSafeInteger(body.result?.message_id)) throw Error('Telegram rejected message');
   const item=p.issue || p.pull_request; const [owner,repo]=(p.repository?.full_name || '').split('/');
   if (entries.length === 1 && item?.number && p.installation?.id && owner && repo) await run(env,'INSERT OR REPLACE INTO messages (chat_id,message_id,owner,repo,issue_number,installation) VALUES (?,?,?,?,?,?)',String(env.TELEGRAM_CHAT_ID),body.result.message_id,owner,repo,item.number,p.installation.id);
@@ -68,7 +68,9 @@ async function deliver(env,id) {
   const entry=await first(env,'SELECT * FROM deliveries WHERE id=?',id);
   const entries=[entry];
   try {
-    let text=format(entry.event,JSON.parse(entry.payload));
+    const formatted=format(entry.event,JSON.parse(entry.payload));
+    let text=formatted?.text;
+    const buttons=formatted?.button ? [formatted.button] : [];
     if (text && Number(env.DIGEST_MS)>0) {
       const topics=JSON.parse(env.TOPIC_ROUTES || '{}');
       const topic=x=>{const p=JSON.parse(x.payload); return topics[p.repository?.full_name] || topics[x.event] || null};
@@ -77,12 +79,12 @@ async function deliver(env,id) {
       for (const candidate of rows.results) {
         if (topic(candidate)!==topic(entry)) continue;
         const part=format(candidate.event,JSON.parse(candidate.payload));
-        if (!part || text.length+part.length+2>4000) continue;
+        if (!part || text.length+part.text.length+2>4000 || buttons.length+(part.button?1:0)>100) continue;
         const claim=await run(env,"UPDATE deliveries SET lease_until=? WHERE id=? AND status='pending' AND next_at<=? AND lease_until<=?",lease,candidate.id,now,now);
-        if (claim.meta.changes) { entries.push(candidate); text+='\n\n'+part; }
+        if (claim.meta.changes) { entries.push(candidate); text+='\n\n'+part.text; if (part.button) buttons.push(part.button); }
       }
     }
-    if (text) await send(env,entries,text);
+    if (text) await send(env,entries,text,buttons);
     for (const item of entries) await run(env,"UPDATE deliveries SET status='done',lease_until=0 WHERE id=? AND lease_until=?",item.id,lease);
   } catch(e) {
     console.error('Delivery failed:',e.message);
