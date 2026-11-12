@@ -16,22 +16,35 @@ async function github(request,env) {
   const id=request.headers.get('x-github-delivery'), event=request.headers.get('x-github-event');
   if (!id || !event) return response(400);
   let p; try { p=JSON.parse(raw.toString()); } catch { return response(400); }
+  const object = x => x && typeof x === 'object' && !Array.isArray(x);
+  const item = x => object(x) && Number.isSafeInteger(x.number) && typeof x.title === 'string' && (x.labels === undefined || (Array.isArray(x.labels) && x.labels.every(label => object(label) && typeof label.name === 'string')));
+  const shapes = {
+    issues: () => item(p.issue) && !p.pull_request,
+    issue_comment: () => item(p.issue) && object(p.comment) && typeof p.comment.body === 'string' && !p.pull_request,
+    pull_request: () => item(p.pull_request) && !p.issue,
+    pull_request_review: () => item(p.pull_request) && object(p.review) && typeof p.review.state === 'string' && !p.issue,
+    push: () => typeof p.ref === 'string' && Array.isArray(p.commits) && p.commits.every(c => object(c) && typeof c.id === 'string' && typeof c.message === 'string'),
+    star: () => typeof p.action === 'string' && !p.issue && !p.pull_request,
+    check_run: () => object(p.check_run) && typeof p.check_run.name === 'string' && !p.issue && !p.pull_request,
+    workflow_run: () => object(p.workflow_run) && typeof p.workflow_run.name === 'string' && !p.issue && !p.pull_request
+  };
+  if (!object(p) || (Object.hasOwn(shapes,event) && (!object(p.repository) || typeof p.repository.full_name !== 'string' || !object(p.sender) || typeof p.sender.login !== 'string' || (event !== 'push' && typeof p.action !== 'string') || !shapes[event]()))) return response(400);
   const allowed=(key,value)=>{const values=list(env[key]); return !values.length || values.includes(value)};
-  const labels=(p.issue || p.pull_request)?.labels?.map(x=>x.name) || [];
+  const labels=Array.isArray((p.issue || p.pull_request)?.labels) ? (p.issue || p.pull_request).labels.map(x=>x?.name) : [];
   const filterLabels=list(env.FILTER_LABELS);
   const pass=allowed('FILTER_REPOS',p.repository?.full_name) && allowed('FILTER_EVENTS',event) && allowed('FILTER_ACTORS',p.sender?.login) && (!filterLabels.length || filterLabels.some(x=>labels.includes(x)));
   const result=await run(env,'INSERT OR IGNORE INTO deliveries (id,event,payload,status,next_at) VALUES (?,?,?,?,?)',id,event,raw.toString(),pass?'pending':'done',Date.now()+Math.max(0,Number(env.DIGEST_MS)||0));
   if (result.meta.changes && pass) await publish(env,id);
   return response(200);
 }
-async function send(env,entry) {
-  const p=JSON.parse(entry.payload), text=format(entry.event,p);
+async function send(env,entries,text) {
+  const entry=entries[0], p=JSON.parse(entry.payload);
   if (!text) return null;
   const topics=JSON.parse(env.TOPIC_ROUTES || '{}'); const topic=topics[p.repository?.full_name] || topics[entry.event];
   const res=await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:env.TELEGRAM_CHAT_ID,text,...(topic?{message_thread_id:topic}:{})}),signal:AbortSignal.timeout(10000)});
   const body=await res.json(); if (!res.ok || !body.ok || !Number.isSafeInteger(body.result?.message_id)) throw Error('Telegram rejected message');
   const item=p.issue || p.pull_request; const [owner,repo]=(p.repository?.full_name || '').split('/');
-  if (item?.number && p.installation?.id && owner && repo) await run(env,'INSERT OR REPLACE INTO messages (chat_id,message_id,owner,repo,issue_number,installation) VALUES (?,?,?,?,?,?)',String(env.TELEGRAM_CHAT_ID),body.result.message_id,owner,repo,item.number,p.installation.id);
+  if (entries.length === 1 && item?.number && p.installation?.id && owner && repo) await run(env,'INSERT OR REPLACE INTO messages (chat_id,message_id,owner,repo,issue_number,installation) VALUES (?,?,?,?,?,?)',String(env.TELEGRAM_CHAT_ID),body.result.message_id,owner,repo,item.number,p.installation.id);
   return body.result;
 }
 async function deliver(env,id) {
@@ -39,13 +52,30 @@ async function deliver(env,id) {
   const claimed=await run(env,"UPDATE deliveries SET lease_until=? WHERE id=? AND status='pending' AND next_at<=? AND lease_until<=?",lease,id,now,now);
   if (!claimed.meta.changes) return;
   const entry=await first(env,'SELECT * FROM deliveries WHERE id=?',id);
+  const entries=[entry];
   try {
-    await send(env,entry);
-    await run(env,"UPDATE deliveries SET status='done',lease_until=0 WHERE id=? AND lease_until=?",id,lease);
+    let text=format(entry.event,JSON.parse(entry.payload));
+    if (text && Number(env.DIGEST_MS)>0) {
+      const topics=JSON.parse(env.TOPIC_ROUTES || '{}');
+      const topic=x=>{const p=JSON.parse(x.payload); return topics[p.repository?.full_name] || topics[x.event] || null};
+      const rows=await all(env,"SELECT * FROM deliveries WHERE id<>? AND status='pending' AND next_at<=? AND lease_until<=? ORDER BY next_at LIMIT 100",id,now,now);
+      // ponytail: scan at most 100 due rows; use indexed topic buckets if throughput matters.
+      for (const candidate of rows.results) {
+        if (topic(candidate)!==topic(entry)) continue;
+        const part=format(candidate.event,JSON.parse(candidate.payload));
+        if (!part || text.length+part.length+2>4000) continue;
+        const claim=await run(env,"UPDATE deliveries SET lease_until=? WHERE id=? AND status='pending' AND next_at<=? AND lease_until<=?",lease,candidate.id,now,now);
+        if (claim.meta.changes) { entries.push(candidate); text+='\n\n'+part; }
+      }
+    }
+    if (text) await send(env,entries,text);
+    for (const item of entries) await run(env,"UPDATE deliveries SET status='done',lease_until=0 WHERE id=? AND lease_until=?",item.id,lease);
   } catch(e) {
     console.error('Delivery failed:',e.message);
-    const delay=Math.min(3600000,1000*2**Math.min(entry.attempts+1,12));
-    await run(env,'UPDATE deliveries SET attempts=attempts+1,next_at=?,lease_until=0 WHERE id=? AND lease_until=?',Date.now()+delay,id,lease);
+    for (const item of entries) {
+      const delay=Math.min(3600000,1000*2**Math.min(item.attempts+1,12));
+      await run(env,'UPDATE deliveries SET attempts=attempts+1,next_at=?,lease_until=0 WHERE id=? AND lease_until=?',Date.now()+delay,item.id,lease);
+    }
   }
 }
 async function comment(env,target,text) {

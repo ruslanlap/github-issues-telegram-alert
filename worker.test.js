@@ -31,3 +31,38 @@ test('Telegram secret, chat, user, mapping and update deduplication protect repl
     assert.equal(JSON.parse(calls[1][1].body).body,'hello');
   } finally {global.fetch=old}
 });
+
+test('signed issue body cannot be reclassified as a pull request',async()=>{
+  const {env,db}=setup();
+  assert.equal((await worker.fetch(req('cross','pull_request',payload),env)).status,400);
+  assert.equal(db.prepare('select count(*) n from deliveries').get().n,0);
+});
+test('digest sends due notifications together without a reply mapping',async()=>{
+  const {env,db,queued}=setup(); env.DIGEST_MS='1';
+  const old=global.fetch, sent=[]; global.fetch=async(_url,opts)=>{sent.push(JSON.parse(opts.body)); return Response.json({ok:true,result:{message_id:9}})};
+  try {
+    await worker.fetch(req('a','issues',payload),env);
+    await worker.fetch(req('b','issues',{...payload,issue:{number:2,title:'second'}}),env);
+    db.prepare('update deliveries set next_at=0').run();
+    await worker.queue({messages:queued.map(body=>({body,ack(){},retry(){}}))},env);
+    assert.equal(sent.length,1); assert.match(sent[0].text,/issue/); assert.match(sent[0].text,/second/);
+    assert.equal(db.prepare("select count(*) n from deliveries where status='done'").get().n,2);
+    assert.equal(db.prepare('select count(*) n from messages').get().n,0);
+  } finally {global.fetch=old}
+});
+
+test('digest separates topics and retries every claimed entry on send failure',async()=>{
+  const {env,db,queued}=setup(); env.DIGEST_MS='1'; env.TOPIC_ROUTES=JSON.stringify({'a/b':1,'c/d':2});
+  const old=global.fetch, sent=[]; global.fetch=async(_url,opts)=>{sent.push(JSON.parse(opts.body)); return new Response('{}',{status:500})};
+  try {
+    await worker.fetch(req('a','issues',payload),env);
+    await worker.fetch(req('b','issues',{...payload,issue:{number:2,title:'second'}}),env);
+    await worker.fetch(req('c','issues',{...payload,repository:{full_name:'c/d'}}),env);
+    db.prepare('update deliveries set next_at=0').run();
+    await worker.queue({messages:[{body:queued[0],ack(){},retry(){}}]},env);
+    assert.equal(sent.length,1); assert.equal(sent[0].message_thread_id,1);
+    assert.equal(db.prepare('select attempts from deliveries where id=?').get('a').attempts,1);
+    assert.equal(db.prepare('select attempts from deliveries where id=?').get('b').attempts,1);
+    assert.equal(db.prepare('select attempts from deliveries where id=?').get('c').attempts,0);
+  } finally {global.fetch=old}
+});
