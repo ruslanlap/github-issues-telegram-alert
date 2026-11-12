@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node --test notifier.test.js"
+    "test": "node --test notifier.test.js worker.test.js"
   },
   "keywords": [
     "github",

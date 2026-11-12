@@ -1,0 +1,21 @@
+name = "github-telegram-notifier"
+main = "worker-entry.mjs"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Replace placeholders after creating resources; do not deploy without review.
+[[d1_databases]]
+binding = "DB"
+database_name = "github-telegram-notifier"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[[queues.producers]]
+binding = "QUEUE"
+queue = "github-telegram-notifier"
+
+[[queues.consumers]]
+queue = "github-telegram-notifier"
+max_batch_size = 10
+
+[triggers]
+crons = ["* * * * *"]
